@@ -1,5 +1,11 @@
 use std::{
-    collections::HashSet, fs, num::NonZeroUsize, os::unix, path::PathBuf, sync::Arc, time::Duration,
+    collections::HashSet,
+    fs,
+    num::NonZeroUsize,
+    os::unix,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use gtk::gdk;
@@ -112,6 +118,22 @@ fn get_cache_directory(name: &str) -> Result<PathBuf, CacheError> {
         PathBuf::from("/tmp")
     };
     Ok(cache_dir.join(APP_ID).join(name))
+}
+
+/// Build the on-disk cache path for an image.
+///
+/// `item_id` is server-controlled and must never be used directly as a path
+/// component: values such as "../../.bashrc" or an absolute path would let a
+/// malicious or compromised server escape the cache directory and read or
+/// overwrite arbitrary files. Hashing it yields a fixed-format, single-segment
+/// filename, so the result always stays inside `cache_dir`. `image_type` comes
+/// from a closed enum (see `ImageType::as_str`), so it is safe as a directory.
+fn cache_file_path(cache_dir: &Path, item_id: &str, image_type: ImageType) -> PathBuf {
+    let fname = format!("{:x}", md5::compute(item_id));
+    match image_type {
+        ImageType::Primary => cache_dir.join(fname),
+        _ => cache_dir.join(image_type.as_str()).join(fname),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -296,12 +318,7 @@ impl ImageCache {
     }
 
     pub fn get_cache_file_path(&self, item_id: &str, image_type: ImageType) -> PathBuf {
-        match image_type {
-            ImageType::Primary => self.cache_dir.join(item_id),
-            _ => self
-                .cache_dir
-                .join(format!("{}/{}", image_type.as_str(), item_id)),
-        }
+        cache_file_path(&self.cache_dir, item_id, image_type)
     }
 
     fn cached_texture(&self, item_id: &str, image_type: ImageType) -> Option<gdk::Texture> {
@@ -376,5 +393,56 @@ impl ImageCache {
         self.texture_cache.lock().unwrap().clear();
         _ = fs::remove_dir_all(&self.cache_dir);
         _ = fs::create_dir_all(&self.cache_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A server-controlled item id must never let the resulting path escape the
+    // cache directory, regardless of traversal sequences or absolute paths.
+    #[test]
+    fn cache_path_stays_within_cache_dir() {
+        let cache_dir = Path::new("/home/user/.cache/io.m51.Gelly/album-art");
+        let malicious_ids = [
+            "../../../../home/user/.bashrc",
+            "/etc/passwd",
+            "../../.config/autostart/evil.desktop",
+            "..",
+            "a/b/c",
+            "",
+        ];
+
+        for id in malicious_ids {
+            for image_type in [ImageType::Primary, ImageType::Backdrop] {
+                let path = cache_file_path(cache_dir, id, image_type);
+                assert!(
+                    path.starts_with(cache_dir),
+                    "path escaped cache dir for id {id:?} / {}: {path:?}",
+                    image_type.as_str()
+                );
+                // No component may be a parent-dir traversal.
+                assert!(
+                    !path.components().any(|c| c.as_os_str() == ".."),
+                    "path contains traversal for id {id:?}: {path:?}"
+                );
+            }
+        }
+    }
+
+    // The same id must map to the same path so the cache keeps working.
+    #[test]
+    fn cache_path_is_deterministic() {
+        let cache_dir = Path::new("/tmp/cache");
+        let id = "real-jellyfin-item-id-1234";
+        assert_eq!(
+            cache_file_path(cache_dir, id, ImageType::Primary),
+            cache_file_path(cache_dir, id, ImageType::Primary),
+        );
+        assert_ne!(
+            cache_file_path(cache_dir, id, ImageType::Primary),
+            cache_file_path(cache_dir, "different-id", ImageType::Primary),
+        );
     }
 }
